@@ -83,7 +83,7 @@ Timeouts are seconds:
 - `IDLE_TIMEOUT`: relay idle timeout after the connection is established.
 - `CAPTURE_SECONDS`: max capture window in `capture_only` mode.
 
-## Running in a lab
+## Running in a lab from source
 
 Install dependencies and run as Administrator on Windows because WinDivert packet capture requires elevated privileges:
 
@@ -93,6 +93,38 @@ python main.py
 ```
 
 Then point a local TCP/TLS client at `LISTEN_HOST:LISTEN_PORT`. Each connection prints a summary and writes a full packet log under `diagnostic_reports/`.
+
+## Building a Windows exe
+
+Use the included PyInstaller scripts from the project root:
+
+```powershell
+.\build_exe.ps1 -Clean
+```
+
+Or with CMD:
+
+```bat
+build_exe.bat -Clean
+```
+
+Default output is an onedir build:
+
+```text
+dist\SNI-Spoofing-Diagnostics\SNI-Spoofing-Diagnostics.exe
+```
+
+The build script embeds/copies `config.json` and uses PyInstaller `--uac-admin`, so Windows should ask for Administrator permission when the exe starts. Administrator permission is required for WinDivert capture. For a single-file exe, run:
+
+```powershell
+.\build_exe.ps1 -Clean -OneFile
+```
+
+For development builds without UAC metadata:
+
+```powershell
+.\build_exe.ps1 -NoUacAdmin
+```
 
 ## How to interpret common results
 

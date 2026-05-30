@@ -1,7 +1,7 @@
 import json
 import os
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
 
@@ -97,6 +97,7 @@ class ConnectionDiagnostics:
     wrong_seq_packet_observed_outbound: bool = False
     ack_for_wrong_seq_packet_received: bool = False
     wrong_seq_ack_advanced: Optional[bool] = None
+    wrong_seq_ack_classification: str = "not_observed"
 
     rst_received: bool = False
     fin_received: bool = False
@@ -111,6 +112,7 @@ class ConnectionDiagnostics:
 
     wrong_seq_seq: Optional[int] = None
     wrong_seq_len: int = 0
+    wrong_seq_expected_end: Optional[int] = None
     last_packet_at: Optional[float] = None
 
     def add_note(self, note: str) -> None:
@@ -139,22 +141,43 @@ class ConnectionDiagnostics:
         self.wrong_seq_packet_observed_outbound = True
         self.wrong_seq_seq = seq
         self.wrong_seq_len = length
+        self.wrong_seq_expected_end = (seq + length) & 0xFFFFFFFF
         self.tls_clienthello_sent = True
         self.add_note(
-            f"wrong_seq probe sent with seq={seq}, ack={ack}, payload_len={length}; this is logged for lab diagnostics only."
+            f"wrong_seq probe sent with seq={seq}, ack={ack}, payload_len={length}, "
+            f"segment_end={self.wrong_seq_expected_end}; this is logged for lab diagnostics only."
         )
 
     def mark_wrong_seq_ack(self, ack_num: int) -> None:
         self.ack_for_wrong_seq_packet_received = True
-        if self.wrong_seq_seq is not None and self.wrong_seq_len:
+        if self.wrong_seq_seq is None or not self.wrong_seq_len:
+            self.wrong_seq_ack_classification = "ack_observed_without_probe_metadata"
+            self.add_note("ACK was seen after wrong_seq, but probe sequence metadata was missing.")
+            return
+
+        expected_end = self.wrong_seq_expected_end
+        if expected_end is None:
             expected_end = (self.wrong_seq_seq + self.wrong_seq_len) & 0xFFFFFFFF
-            self.wrong_seq_ack_advanced = seq_delta(expected_end, ack_num) < 0x80000000 and ack_num == expected_end
-            if self.wrong_seq_ack_advanced:
-                self.add_note("Inbound ACK exactly matched the end of the wrong-sequence payload.")
-            else:
-                self.add_note(
-                    "Inbound ACK was seen after the wrong-sequence payload, but it did not advance to the injected payload end."
-                )
+
+        if ack_num == expected_end:
+            self.wrong_seq_ack_advanced = False
+            self.wrong_seq_ack_classification = "duplicate_ack_at_current_next_seq"
+            self.add_note(
+                "ACK after wrong_seq matched the segment end/current TCP next sequence. "
+                "This usually means the receiver treated the segment as old/duplicate and did not accept fake payload."
+            )
+        elif seq_delta(expected_end, ack_num) < 0x80000000:
+            self.wrong_seq_ack_advanced = True
+            self.wrong_seq_ack_classification = "ack_advanced_beyond_wrong_seq_end"
+            self.add_note(
+                "ACK after wrong_seq advanced beyond the injected segment end; inspect the path because this is unusual."
+            )
+        else:
+            self.wrong_seq_ack_advanced = False
+            self.wrong_seq_ack_classification = "ack_did_not_reach_wrong_seq_end"
+            self.add_note(
+                "ACK was seen after wrong_seq, but it did not reach the injected segment end."
+            )
 
     def mark_unexpected(self, reason: str) -> None:
         self.close_reason = reason
@@ -226,15 +249,19 @@ class ConnectionDiagnostics:
                 self.likely_cause = "TCP handshake not confirmed"
         elif self.rst_received:
             self.likely_cause = "connection reset after TCP handshake by endpoint or an on-path device"
-        elif self.fin_received:
-            self.likely_cause = "connection closed with FIN after TCP handshake"
         elif self.wrong_seq_packet_observed_outbound and self.ack_for_wrong_seq_packet_received:
-            if self.wrong_seq_ack_advanced:
-                self.likely_cause = "wrong_seq packet received an ACK; inspect path because endpoint behavior is unusual"
+            if self.wrong_seq_ack_classification == "duplicate_ack_at_current_next_seq":
+                self.likely_cause = "wrong_seq appears ignored as old/duplicate; normal TCP/TLS flow continued until close"
+            elif self.wrong_seq_ack_advanced:
+                self.likely_cause = "wrong_seq produced an unusual advancing ACK; inspect endpoint/path behavior"
             else:
-                self.likely_cause = "wrong_seq appears ignored by TCP state while still visible in outbound capture"
+                self.likely_cause = "wrong_seq did not produce evidence of accepted fake payload"
+            if self.fin_received:
+                self.likely_cause += "; connection later closed with FIN"
         elif self.wrong_seq_packet_observed_outbound and self.timeout:
             self.likely_cause = "wrong_seq no longer produced a useful response; packet may be ignored, normalized, or dropped"
+        elif self.fin_received:
+            self.likely_cause = "connection closed with FIN after TCP handshake"
         elif self.tls_clienthello_sent and self.timeout:
             self.likely_cause = "silent drop after TLS ClientHello phase"
         else:
@@ -248,7 +275,8 @@ class ConnectionDiagnostics:
             "Drop after TCP handshake": yes_no(self.drop_after_handshake),
             "TLS ClientHello sent": yes_no(self.tls_clienthello_sent),
             "Wrong-sequence packet observed outbound": yes_no(self.wrong_seq_packet_observed_outbound),
-            "ACK for wrong-sequence packet received": yes_no(self.ack_for_wrong_seq_packet_received),
+            "ACK after wrong-sequence packet observed": yes_no(self.ack_for_wrong_seq_packet_received),
+            "Wrong-sequence ACK classification": self.wrong_seq_ack_classification,
             "RST received": yes_no(self.rst_received),
             "FIN received": yes_no(self.fin_received),
             "Timeout": yes_no(self.timeout),
